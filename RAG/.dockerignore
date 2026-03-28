@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Persisted FAISS index and documents (mounted volumes, not baked into image)
+/data/
+*.faiss
+*.pkl

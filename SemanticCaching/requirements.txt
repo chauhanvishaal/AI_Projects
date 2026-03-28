@@ -1,0 +1,26 @@
+# Semantic Cache — Python dependencies
+# All packages are free and open-source.
+
+# Redis client (hiredis C extension for fast parsing)
+redis[hiredis]>=5.0.0
+
+# Vector search (CPU build — no GPU required)
+faiss-cpu>=1.8.0
+
+# Numerical computing
+numpy>=1.26.0
+
+# LangChain ecosystem
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-ollama>=0.2.0
+
+# FastAPI + ASGI server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# Pydantic v2
+pydantic>=2.7.0
+
+# HTTP client (used in api.py to call Ollama)
+httpx>=0.27.0

@@ -1,0 +1,146 @@
+################################################################################
+# RAG Workflow — docker-compose.yml
+#
+# Brings up the full free-stack RAG pipeline: Ollama (LLM + embeddings),
+# the Semantic Cache service (semcache-api), and the RAG API (rag-api).
+#
+# Port mapping (host → container):
+#   11434 → ollama        (Ollama API)
+#   8000  → semcache-api  (Semantic Cache REST)
+#   8001  → rag-api       (RAG Workflow REST)
+#
+# Usage:
+#   cp .env.example .env   # fill in API keys
+#   docker compose up -d
+################################################################################
+
+name: rag-workflow
+
+services:
+
+  # ── Shared model server ───────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - rag-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # One-shot service: pulls required models before anything else starts
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - rag-net
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "ollama pull ${OLLAMA_MODEL:-llama3} && ollama pull ${EMBEDDING_MODEL:-nomic-embed-text}"
+    restart: "no"
+
+  # ── Redis (used by semcache-api only) ─────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    networks:
+      - rag-net
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Semantic Cache service (separate SRP service) ─────────────────────────
+  semcache-api:
+    build:
+      context: ../SemanticCaching
+      dockerfile: Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL:            "${REDIS_URL:-redis://redis:6379}"
+      OLLAMA_BASE_URL:      "${OLLAMA_BASE_URL:-http://ollama:11434}"
+      OLLAMA_MODEL:         "${OLLAMA_MODEL:-llama3}"
+      EMBEDDING_MODEL:      "${EMBEDDING_MODEL:-nomic-embed-text}"
+      SIMILARITY_THRESHOLD: "${SIMILARITY_THRESHOLD:-0.92}"
+      DEFAULT_TTL:          "${DEFAULT_TTL:-3600}"
+      NAMESPACE:            "${NAMESPACE:-rag}"
+      LOCK_TIMEOUT:         "${LOCK_TIMEOUT:-30}"
+      MAX_LOCK_RETRIES:     "${MAX_LOCK_RETRIES:-10}"
+      API_KEY:              "${SEMCACHE_API_KEY}"
+    networks:
+      - rag-net
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data  # redis owns this volume; semcache only uses Redis over TCP
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── RAG Workflow API ──────────────────────────────────────────────────────
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      semcache-api:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    ports:
+      - "8001:8000"
+    environment:
+      OLLAMA_BASE_URL:  "${OLLAMA_BASE_URL:-http://ollama:11434}"
+      OLLAMA_MODEL:     "${OLLAMA_MODEL:-llama3}"
+      EMBEDDING_MODEL:  "${EMBEDDING_MODEL:-nomic-embed-text}"
+      FAISS_INDEX_PATH: "/data/faiss_index"
+      DOCS_PATH:        "/data/documents"
+      CHUNK_SIZE:       "${CHUNK_SIZE:-512}"
+      CHUNK_OVERLAP:    "${CHUNK_OVERLAP:-64}"
+      RETRIEVAL_TOP_K:  "${RETRIEVAL_TOP_K:-4}"
+      API_KEY:          "${RAG_API_KEY}"
+      # Cache client config (mirrors SemanticCacheClient env vars)
+      SEMCACHE_BASE_URL: "${SEMCACHE_BASE_URL:-http://semcache-api:8000}"
+      SEMCACHE_API_KEY:  "${SEMCACHE_API_KEY}"
+      SEMCACHE_AGENT_ID: "${SEMCACHE_AGENT_ID:-rag-workflow}"
+      SEMCACHE_TTL:      "${SEMCACHE_TTL:-3600}"
+      SEMCACHE_TIMEOUT:  "${SEMCACHE_TIMEOUT:-5.0}"
+    volumes:
+      - rag-data:/data
+    networks:
+      - rag-net
+    restart: unless-stopped
+
+volumes:
+  ollama-data:
+  redis-data:
+  rag-data:
+
+networks:
+  rag-net:
+    driver: bridge

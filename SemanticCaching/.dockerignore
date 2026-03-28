@@ -1,0 +1,26 @@
+# .dockerignore — files excluded from the Docker build context
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment — never bake secrets into the image
+.env
+
+# Development / editor artefacts
+.venv/
+.vscode/
+.idea/
+*.egg-info/
+dist/
+build/
+
+# Test artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Git
+.git/
+.gitignore

@@ -1,0 +1,122 @@
+# docker-compose.yml — Semantic Cache full stack
+# -----------------------------------------------
+# Services:
+#   redis        — Redis OSS 7 (cache store, Pub/Sub, distributed lock)
+#   ollama       — Local LLM server
+#   ollama-init  — One-shot container that pulls the configured LLM model
+#   semcache-api — FastAPI semantic cache service (built from Dockerfile)
+#
+# Usage:
+#   1. cp .env.example .env  and fill in API_KEY (at minimum)
+#   2. docker compose up --build
+#   3. curl http://localhost:8000/health
+#
+# Volumes:
+#   redis-data       — Redis persistence (AOF)
+#   ollama-data      — Ollama model weights
+#   huggingface-data — HuggingFace / sentence-transformers model cache
+
+services:
+
+  # --------------------------------------------------------------------------
+  # Redis — OSS 7, append-only persistence enabled
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - semcache-net
+
+  # --------------------------------------------------------------------------
+  # Ollama — local LLM inference server (CPU)
+  # --------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+    networks:
+      - semcache-net
+
+  # --------------------------------------------------------------------------
+  # ollama-init — pulls the model once then exits (idempotent)
+  # --------------------------------------------------------------------------
+  ollama-init:
+    image: ollama/ollama:latest
+    restart: "no"
+    entrypoint: >
+      sh -c "ollama pull ${OLLAMA_MODEL:-llama3} && ollama pull ${EMBEDDING_MODEL:-nomic-embed-text} && echo 'Model pulls complete'"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ollama-data:/root/.ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - semcache-net
+
+  # --------------------------------------------------------------------------
+  # semcache-api — FastAPI semantic cache service
+  # --------------------------------------------------------------------------
+  semcache-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # These defaults match compose service names; override in .env if needed.
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+    depends_on:
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s   # allow time for HF model download on first start
+    networks:
+      - semcache-net
+
+# --------------------------------------------------------------------------
+# Named volumes
+# --------------------------------------------------------------------------
+volumes:
+  redis-data:
+  ollama-data:
+
+# --------------------------------------------------------------------------
+# Network
+# --------------------------------------------------------------------------
+networks:
+  semcache-net:
+    driver: bridge
