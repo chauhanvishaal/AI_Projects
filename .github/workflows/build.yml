@@ -1,14 +1,16 @@
 name: Build Pipeline
 
 on:
-  workflow_run:
-    workflows: [ "Automated Code Review" ]
-    types:
-      - completed
-
+  # workflow_run:
+  #   workflows: [ "Automated Code Review" ]
+  #   types:
+  #     - completed
+  push:
+    branches: ["main"]
+    
 jobs:
   build:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
     strategy:
