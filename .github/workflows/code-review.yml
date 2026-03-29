@@ -22,7 +22,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: AI_Projects/${{ matrix.project }}
+        working-directory: ${{ matrix.project }}
 
     steps:
       - name: Checkout repository
