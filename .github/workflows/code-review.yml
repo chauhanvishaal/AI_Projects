@@ -1,0 +1,54 @@
+name: Automated Code Review
+
+on:
+  pull_request:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  code_review:
+    name: Lint, Format, Type Check, Security Scan
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        project: [ "Semantic_Cache", "RAG" ]
+        python-version: [ "3.13" ]
+
+    defaults:
+      run:
+        working-directory: AI_Projects/${{ matrix.project }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install review tools
+        run: |
+          pip install --upgrade pip
+          pip install ruff mypy bandit pip-audit
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Type checking (mypy)
+        run: mypy .
+
+      - name: Security scan (Bandit)
+        run: bandit -r .
+
+      - name: Dependency vulnerability scan
+        run: pip-audit
