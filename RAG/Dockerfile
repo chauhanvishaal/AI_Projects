@@ -21,8 +21,11 @@ WORKDIR /app
 # Copy only installed packages (no compiler toolchain in production image)
 COPY --from=builder /install /usr/local
 
-# Application source (SRP: only the two files that belong to this service)
-COPY workflow.py cache_client.py ./
+# Application source — all modules of the refactored RAG service
+COPY cache_client.py config.py schemas.py models.py \
+     store.py ingestion.py rag_chain.py \
+     auth.py dependencies.py app.py ./
+COPY routers/ ./routers/
 
 # Non-root user for security
 RUN adduser --disabled-password --no-create-home appuser \
@@ -35,4 +38,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"
 
-CMD ["uvicorn", "workflow:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

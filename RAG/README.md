@@ -15,74 +15,90 @@ Client
 ┌──────────────────────────────────────────────────────────┐
 │                      rag-api  :8001                      │
 │                                                          │
-│  POST /query                                             │
+│  app.py  (lifespan + router wiring)                      │
 │    │                                                     │
-│    ├─ 1. cache_client.lookup(question)   ─────────────┐  │
-│    │         HIT  → return instantly (~5 ms)          │  │
-│    │         MISS ↓                                   │  │
-│    ├─ 2. _run_rag(question, top_k)                    │  │
-│    │         FAISS retriever                          │  │
-│    │           → format chunks                        │  │
-│    │           → ChatPromptTemplate                   │  │
-│    │           → OllamaLLM                            │  │
-│    │           → StrOutputParser                      │  │
-│    │                                                  │  │
-│    └─ 3. cache_client.store(question, answer) ───────►│  │
-│                                                       │  │
-│  cache_client.py ─────────── HTTP ───────────────────►│  │
-└───────────────────────────────────────────────────────┼──┘
-                                                        │
-                    ┌───────────────────────────────────┘
-                    ▼
-        ┌────────────────────┐      ┌───────────────┐
-        │   semcache-api     │      │    Ollama     │
-        │   :8000            │      │   :11434      │
-        │                    │      │               │
-        │  POST /query       │      │ • llama3 (LLM)│
-        │  PUT  /cache       │      │ • nomic-embed │
-        │                    │      │   -text       │
-        └────────┬───────────┘      └───────┬───────┘
-                 │                          │
-                 ▼                          │ embeddings
-           ┌──────────┐         ┌───────────┴─────────┐
-           │  Redis   │         │     FAISS index      │
-           │  OSS 7   │         │  (disk-persisted,    │
-           │          │         │   Docker volume)     │
-           └──────────┘         └─────────────────────┘
+│    ├── routers/query.py    POST /query                   │
+│    │     │  1. dependencies.get_cache_client().lookup()  │
+│    │     │        HIT  → return instantly (~5 ms)        │
+│    │     │        MISS ↓                                 │
+│    │     │  2. rag_chain.run(question, top_k)            │
+│    │     │        store.vector_store_manager             │
+│    │     │          → FAISS retriever                    │
+│    │     │          → ChatPromptTemplate                 │
+│    │     │          → models.get_llm() (Ollama)         │
+│    │     │          → StrOutputParser                    │
+│    │     │  3. cache_client.store()  (fire-and-forget)   │
+│    │     │                                               │
+│    ├── routers/ingest.py   POST /ingest  DELETE /index   │
+│    │     └─ ingestion_service.ingest(file_paths)         │
+│    │             → DocumentIngestionService              │
+│    │               (load → split → embed → FAISS)        │
+│    │                                                     │
+│    └── routers/health.py   GET /health  (no auth)        │
+│                                                          │
+│  auth.py          X-API-Key  secrets.compare_digest      │
+│  config.py        Typed settings (frozen dataclass)      │
+│  schemas.py       Pydantic request / response models     │
+└──────────────────────────────────────────────────────────┘
+              │ HTTP                │ HTTP
+              ▼                    ▼
+   ┌────────────────────┐  ┌───────────────┐
+   │   semcache-api     │  │    Ollama     │
+   │   :8000            │  │   :11434      │
+   │  POST /query       │  │ • llama3      │
+   │  PUT  /cache       │  │ • nomic-embed │
+   └────────┬───────────┘  └───────┬───────┘
+            │                      │ embeddings
+            ▼                      ▼
+      ┌──────────┐      ┌─────────────────────┐
+      │  Redis   │      │  FAISS index        │
+      │  OSS 7   │      │  (disk-persisted,   │
+      └──────────┘      │   Docker volume)    │
+                        └─────────────────────┘
 ```
 
-### Single Responsibility design
+---
 
-Each file has exactly **one reason to change:**
+## Module design — Single Responsibility Principle
 
-| File | Responsibility |
-|---|---|
-| `workflow.py` | RAG pipeline only (load, chunk, embed, retrieve, generate) |
-| `cache_client.py` | HTTP gateway to `semcache-api` only — no RAG logic |
+Each module has **exactly one reason to change**:
 
-`workflow.py` calls `cache_client.lookup()` and `cache_client.store()` but has zero knowledge of Redis, FAISS vectors, or similarity thresholds — those are the cache service's concern.
+| Module | Responsibility | Changes when… |
+|---|---|---|
+| `config.py` | Typed settings from env vars (`frozen` dataclass) | A new env var or default is added |
+| `schemas.py` | Pydantic request / response models | API contract changes |
+| `models.py` | Ollama LLM + embeddings singletons | Switching model provider |
+| `store.py` | `VectorStoreManager` — FAISS lifecycle (load, save, clear) | Switching vector database |
+| `ingestion.py` | `DocumentIngestionService` — load, chunk, embed, index | New file formats or splitter strategy |
+| `rag_chain.py` | `RAGChain` — FAISS retrieval + Ollama LLM generation | Prompt, retrieval strategy, or LLM changes |
+| `auth.py` | `require_api_key` FastAPI dependency | Switching auth mechanism |
+| `dependencies.py` | Shared injectable FastAPI dependencies | New app-wide singletons |
+| `routers/query.py` | `POST /query` orchestration | Query endpoint behaviour |
+| `routers/ingest.py` | `POST /ingest`, `DELETE /index` | Upload / index management |
+| `routers/health.py` | `GET /health` | Health probe logic |
+| `app.py` | FastAPI factory, lifespan, router registration | Adding/removing routers |
+| `cache_client.py` | HTTP gateway to `semcache-api` | Cache service API changes |
+| `workflow.py` | Backward-compat shim (`from app import app`) | Deprecated |
 
 ### Query flow
 
 ```
-POST /query  (rag-api:8001)
+POST /query  →  routers/query.py
   │
-  1. SemanticCacheClient.lookup(question)
-  │         → POST semcache-api:8000/query
+  1. dependencies.get_cache_client().lookup(question)
   │         HIT  → return instantly  (cache_hit=True, sources=[], chunks=0)
   │         MISS ↓
   │
-  2. _run_rag(question, top_k)              ← this service's only real job
-  │         FAISS.as_retriever(k=top_k)
-  │           → retrieve chunks
-  │           → _format_docs([source, content])
-  │           → ChatPromptTemplate.from_template(...)
-  │           → OllamaLLM(llama3)
-  │           → StrOutputParser()
+  2. rag_chain.run(question, top_k)           ← RAGChain (rag_chain.py)
+  │         store.vector_store_manager        ← VectorStoreManager (store.py)
+  │           → FAISS.as_retriever(k=top_k)
+  │           → _format_docs(chunks)
+  │           → ChatPromptTemplate            ← prompt in rag_chain.py
+  │           → models.get_llm()             ← OllamaLLM (models.py)
+  │           → StrOutputParser
   │
-  3. SemanticCacheClient.store(question, answer)
-              → PUT semcache-api:8000/cache
-              (fire-and-forget — never blocks the response)
+  3. cache_client.store(question, answer)
+              → PUT semcache-api:8000/cache   (fire-and-forget)
 ```
 
 ### Supported document types
@@ -95,14 +111,14 @@ POST /query  (rag-api:8001)
 
 ### API routes
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/query` | ✅ | Answer a question via RAG (with semantic cache) |
-| `POST` | `/ingest` | ✅ | Upload documents (multipart/form-data) |
-| `DELETE` | `/index` | ✅ | Wipe the FAISS index |
-| `GET` | `/health` | ❌ | Ollama + cache + FAISS status (unauthenticated) |
+| Method | Path | Auth | Module | Description |
+|---|---|---|---|---|
+| `POST` | `/query` | ✅ | `routers/query.py` | Answer a question via RAG (with semantic cache) |
+| `POST` | `/ingest` | ✅ | `routers/ingest.py` | Upload documents (multipart/form-data) |
+| `DELETE` | `/index` | ✅ | `routers/ingest.py` | Wipe the FAISS index |
+| `GET` | `/health` | ❌ | `routers/health.py` | Ollama + cache + FAISS status |
 
-`POST /query` accepts `use_cache: false` to force a fresh RAG call, bypassing the semantic cache entirely.
+`POST /query` accepts `use_cache: false` to force a fresh RAG call, bypassing the semantic cache.
 
 ---
 
@@ -110,8 +126,22 @@ POST /query  (rag-api:8001)
 
 ```
 RAG/
-├── workflow.py          # FastAPI app — RAG pipeline (ingestion + retrieval + LLM)
-├── cache_client.py      # SRP HTTP client for semcache-api
+├── app.py               # FastAPI factory — lifespan + router wiring
+├── config.py            # Typed settings (frozen dataclass, env vars)
+├── schemas.py           # Pydantic request / response models
+├── models.py            # Ollama LLM + embeddings singletons
+├── store.py             # VectorStoreManager — FAISS persistence lifecycle
+├── ingestion.py         # DocumentIngestionService — load, chunk, embed, index
+├── rag_chain.py         # RAGChain — FAISS retrieval + Ollama LLM generation
+├── auth.py              # X-API-Key FastAPI dependency
+├── dependencies.py      # Shared injectable dependencies
+├── cache_client.py      # HTTP gateway to semcache-api (SRP: cache only)
+├── routers/
+│   ├── __init__.py
+│   ├── query.py         # POST /query
+│   ├── ingest.py        # POST /ingest, DELETE /index
+│   └── health.py        # GET /health
+├── workflow.py          # Backward-compat shim → from app import app
 ├── example_usage.py     # Demo: health, ingest, query, latency comparison
 ├── requirements.txt     # Python dependencies
 ├── Dockerfile           # 2-stage build (builder → slim runtime)
@@ -122,38 +152,92 @@ RAG/
 
 ---
 
-## Setup & install
+## Build & test — step by step
 
-### Option A — Docker Compose (recommended)
+### Prerequisites
 
-This brings up the **complete stack**: Ollama, Redis, semcache-api, and rag-api together.
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows / macOS) or Docker Engine + Compose plugin (Linux)
+- `curl` (or any HTTP client)
+- Python 3.12+ (only needed for local dev / unit tests)
 
-**Prerequisites:** Docker Desktop (or Docker Engine + Compose plugin)
+---
+
+### Step 1 — Clone / navigate to the project
 
 ```bash
 cd d:\dev\py\AI_Projects\RAG
-
-# 1. Create your .env file
-cp .env.example .env
-
-# 2. Generate strong API keys (one for RAG, one for the cache service)
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-
-# Edit .env and set:
-#   RAG_API_KEY=<first generated value>
-#   SEMCACHE_API_KEY=<second generated value>
-
-# 3. Build and start all services
-docker compose up --build
-
-# First run pulls Ollama models (llama3 ~4 GB, nomic-embed-text ~270 MB).
-# semcache-api starts on :8000, rag-api on :8001.
-
-# 4. Verify
-curl http://localhost:8001/health
 ```
 
-Expected health response:
+---
+
+### Step 2 — Create environment file
+
+```bash
+cp .env.example .env
+```
+
+Generate two strong API keys — one for `rag-api`, one for `semcache-api`:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+# run twice — copy the two outputs
+```
+
+Open `.env` and set:
+
+```ini
+RAG_API_KEY=<first key>
+SEMCACHE_API_KEY=<second key>
+```
+
+---
+
+### Step 3 — Build all Docker images
+
+```bash
+docker compose build
+```
+
+This builds:
+- `rag-api` from `RAG/Dockerfile` (2-stage, `python:3.12-slim`)
+- `semcache-api` from `../SemanticCaching/Dockerfile`
+
+---
+
+### Step 4 — Start the full stack
+
+```bash
+docker compose up -d
+```
+
+Services started and their ports:
+
+| Service | Host port | Purpose |
+|---|---|---|
+| `ollama` | 11434 | LLM + embedding model server |
+| `ollama-init` | — | One-shot: pulls `llama3` and `nomic-embed-text` |
+| `redis` | 6379 | Semantic cache store |
+| `semcache-api` | 8000 | Semantic Cache REST API |
+| `rag-api` | 8001 | RAG Workflow REST API |
+
+> **First run:** `ollama-init` pulls `llama3` (~4 GB) and `nomic-embed-text` (~270 MB). This happens once; subsequent starts use the cached `ollama-data` volume. `rag-api` will not start until model pulls complete.
+
+Watch startup progress:
+
+```bash
+docker compose logs -f
+```
+
+---
+
+### Step 5 — Verify health
+
+```bash
+# RAG service (unauthenticated)
+curl -s http://localhost:8001/health | python -m json.tool
+```
+
+Expected:
 ```json
 {
   "ollama": "ok",
@@ -163,34 +247,191 @@ Expected health response:
 }
 ```
 
-### Option B — Local development (no Docker for RAG, cache in Docker)
+```bash
+# Semantic cache service
+curl -s http://localhost:8000/health | python -m json.tool
+```
+
+Expected:
+```json
+{"redis": "ok", "ollama": "ok", "faiss_vectors": 0}
+```
+
+If either service shows `"fail"`, check `docker compose logs <service-name>`.
+
+---
+
+### Step 6 — Ingest documents
+
+Upload a document so the RAG pipeline has something to retrieve from:
 
 ```bash
-# 1. Start the Semantic Cache service (prerequisite)
-cd d:\dev\py\AI_Projects\SemanticCaching
-docker compose up -d          # exposes semcache-api on :8000
+RAG_KEY="<your RAG_API_KEY from .env>"
 
-# 2. Set up RAG virtualenv
+# Using the sample text from example_usage.py (auto-created if you run the script)
+# Or upload your own:
+curl -s -X POST http://localhost:8001/ingest \
+  -H "X-API-Key: $RAG_KEY" \
+  -F "files=@./sample_docs/sample.txt" \
+  | python -m json.tool
+```
+
+Expected:
+```json
+{
+  "chunks_added": 3,
+  "total_vectors": 3,
+  "latency_ms": 812.4
+}
+```
+
+---
+
+### Step 7 — Run a query (cache miss → RAG)
+
+```bash
+curl -s -X POST http://localhost:8001/query \
+  -H "X-API-Key: $RAG_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is Retrieval-Augmented Generation?", "top_k": 4}' \
+  | python -m json.tool
+```
+
+Expected (first call — cache miss, full RAG chain):
+```json
+{
+  "answer": "Retrieval-Augmented Generation (RAG) combines ...",
+  "sources": ["sample.txt"],
+  "chunks_retrieved": 3,
+  "cache_hit": false,
+  "latency_ms": 4231.0
+}
+```
+
+---
+
+### Step 8 — Run a semantically similar query (cache hit)
+
+```bash
+curl -s -X POST http://localhost:8001/query \
+  -H "X-API-Key: $RAG_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Can you explain what RAG means in AI?", "top_k": 4}' \
+  | python -m json.tool
+```
+
+Expected (similar question — cosine ≥ 0.92 → cache hit, ~ms latency):
+```json
+{
+  "answer": "Retrieval-Augmented Generation (RAG) combines ...",
+  "sources": [],
+  "chunks_retrieved": 0,
+  "cache_hit": true,
+  "latency_ms": 47.2
+}
+```
+
+---
+
+### Step 9 — Run the full demo script
+
+```bash
+# Requires the services to be running (Step 4)
+set RAG_API_KEY=<your key>          # Windows
+# export RAG_API_KEY=<your key>     # macOS/Linux
+
+python example_usage.py
+```
+
+This runs all four demo sections automatically:
+1. Health check
+2. Document ingestion (auto-creates `./sample_docs/sample.txt` if needed)
+3. Query with cache miss then hit
+4. Latency comparison (shows typical 80× speed-up)
+
+---
+
+### Step 10 — Unit test: cache client graceful degradation
+
+This test runs without Docker — it verifies `cache_client.py` behaves safely when `semcache-api` is unreachable:
+
+```bash
 cd d:\dev\py\AI_Projects\RAG
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # macOS / Linux
 
-pip install -r requirements.txt
+# Windows (set env vars before running)
+set SEMCACHE_BASE_URL=http://localhost:9999
+set SEMCACHE_TIMEOUT=1.0
+python -c "
+from cache_client import SemanticCacheClient
+c = SemanticCacheClient()
+assert c.is_available() is False, 'Expected False'
+assert c.lookup('any question') is None, 'Expected None'
+c.store('any question', 'any answer')
+print('cache_client graceful degradation: PASS')
+"
+```
 
-# 3. Configure environment
-set OLLAMA_BASE_URL=http://localhost:11434
-set EMBEDDING_MODEL=nomic-embed-text
-set OLLAMA_MODEL=llama3
-set FAISS_INDEX_PATH=./data/faiss_index
-set DOCS_PATH=./data/documents
-set API_KEY=dev-key
-set SEMCACHE_BASE_URL=http://localhost:8000
-set SEMCACHE_API_KEY=<your semcache API_KEY>
-set SEMCACHE_AGENT_ID=rag-workflow
+---
 
-# 4. Start the RAG API
-uvicorn workflow:app --host 0.0.0.0 --port 8001 --reload
+### Step 11 — Test auth enforcement
+
+```bash
+# Missing API key — expect 403
+curl -s -o /dev/null -w "%{http_code}" \
+  -X POST http://localhost:8001/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "test"}'
+# Expected: 403
+
+# Wrong key — expect 403
+curl -s -o /dev/null -w "%{http_code}" \
+  -X POST http://localhost:8001/query \
+  -H "X-API-Key: wrong-key" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "test"}'
+# Expected: 403
+
+# Correct key — expect 200 or 503 (503 = no documents ingested yet, not an auth failure)
+curl -s -o /dev/null -w "%{http_code}" \
+  -X POST http://localhost:8001/query \
+  -H "X-API-Key: $RAG_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "test"}'
+# Expected: 200 (if documents ingested) or 503 (if not)
+```
+
+---
+
+### Step 12 — Test index management
+
+```bash
+# Clear the FAISS index
+curl -s -X DELETE http://localhost:8001/index \
+  -H "X-API-Key: $RAG_KEY" | python -m json.tool
+# Expected: {"cleared": true}
+
+# Confirm 0 vectors in health
+curl -s http://localhost:8001/health | python -m json.tool
+# Expected: "faiss_vectors": 0
+
+# Query with no documents → expect 503
+curl -s -X POST http://localhost:8001/query \
+  -H "X-API-Key: $RAG_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "anything"}' | python -m json.tool
+# Expected: 503 with detail message
+```
+
+---
+
+### Stop the stack
+
+```bash
+# Stop services, keep data volumes (FAISS index + Ollama models survive)
+docker compose down
+
+# Stop and wipe all data (models will re-download on next start)
+docker compose down -v
 ```
 
 ---
@@ -201,195 +442,64 @@ uvicorn workflow:app --host 0.0.0.0 --port 8001 --reload
 |---|---|---|
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `llama3` | LLM model for answer generation |
-| `EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model (must match semcache) |
-| `FAISS_INDEX_PATH` | `/data/faiss_index` | Disk location for persisted FAISS index |
+| `EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model (must match `semcache`) |
+| `FAISS_INDEX_PATH` | `/data/faiss_index` | Disk path for persisted FAISS index |
 | `DOCS_PATH` | `/data/documents` | Documents auto-ingested on startup |
-| `CHUNK_SIZE` | `512` | Token chunk size for text splitting |
+| `CHUNK_SIZE` | `512` | Characters per text chunk |
 | `CHUNK_OVERLAP` | `64` | Overlap between adjacent chunks |
-| `RETRIEVAL_TOP_K` | `4` | Number of chunks retrieved per query |
+| `RETRIEVAL_TOP_K` | `4` | Chunks retrieved per query |
 | `API_KEY` | *(empty)* | X-API-Key for RAG API; empty = no auth (dev only) |
 | `SEMCACHE_BASE_URL` | `http://semcache-api:8000` | URL of the Semantic Cache service |
 | `SEMCACHE_API_KEY` | *(empty)* | Must match `API_KEY` in the cache service |
 | `SEMCACHE_AGENT_ID` | `rag-workflow` | Namespaces RAG cache entries |
 | `SEMCACHE_TTL` | `3600` | How long RAG answers stay in the cache (seconds) |
-| `SEMCACHE_TIMEOUT` | `5.0` | Max seconds to wait for cache HTTP calls |
+| `SEMCACHE_TIMEOUT` | `5.0` | Max wait for cache HTTP calls (seconds) |
 
 ---
 
-## Start / stop
+## Local development (without Docker)
 
 ```bash
-# Start (detached)
-docker compose up -d
+# 1. Start the Semantic Cache service
+cd d:\dev\py\AI_Projects\SemanticCaching
+docker compose up -d          # semcache-api on :8000
 
-# View logs for just the RAG service
-docker compose logs -f rag-api
-
-# View logs for all services
-docker compose logs -f
-
-# Stop (keep volumes / FAISS index)
-docker compose down
-
-# Stop and wipe all data
-docker compose down -v
-```
-
----
-
-## Testing
-
-### Quick smoke test (curl)
-
-```bash
-RAG_KEY="your-rag-api-key"
-BASE="http://localhost:8001"
-
-# Health (no auth)
-curl $BASE/health
-
-# Ingest a document
-curl -s -X POST $BASE/ingest \
-  -H "X-API-Key: $RAG_KEY" \
-  -F "files=@./sample_docs/sample.txt" | python -m json.tool
-
-# First query — cache miss, full RAG chain runs
-curl -s -X POST $BASE/query \
-  -H "X-API-Key: $RAG_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is Retrieval-Augmented Generation?", "top_k": 4}' \
-  | python -m json.tool
-
-# Semantically similar query — should be a cache hit
-curl -s -X POST $BASE/query \
-  -H "X-API-Key: $RAG_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Can you explain what RAG means in AI?", "top_k": 4}' \
-  | python -m json.tool
-
-# Force a fresh RAG call (bypass cache)
-curl -s -X POST $BASE/query \
-  -H "X-API-Key: $RAG_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is RAG?", "use_cache": false}' \
-  | python -m json.tool
-```
-
-### Example usage script
-
-The included `example_usage.py` runs four demo sections automatically:
-
-```bash
+# 2. Set up RAG virtualenv
 cd d:\dev\py\AI_Projects\RAG
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # macOS / Linux
+pip install -r requirements.txt
 
-# Run all sections (health → ingest → query → latency comparison)
-RAG_API_KEY=your-key python example_usage.py
+# 3. Set env vars (Windows)
+set OLLAMA_BASE_URL=http://localhost:11434
+set OLLAMA_MODEL=llama3
+set EMBEDDING_MODEL=nomic-embed-text
+set FAISS_INDEX_PATH=./data/faiss_index
+set DOCS_PATH=./data/documents
+set API_KEY=dev-key
+set SEMCACHE_BASE_URL=http://localhost:8000
+set SEMCACHE_API_KEY=<semcache API_KEY value>
+set SEMCACHE_AGENT_ID=rag-workflow
 
-# Individual sections
-DEMO_MODE=ingest  RAG_API_KEY=your-key python example_usage.py
-DEMO_MODE=query   RAG_API_KEY=your-key python example_usage.py
-DEMO_MODE=latency RAG_API_KEY=your-key python example_usage.py
+# 4. Start with live reload
+uvicorn app:app --host 0.0.0.0 --port 8001 --reload
 ```
 
-The script auto-creates a `./sample_docs/sample.txt` with RAG-related content if no documents are found, so it runs end-to-end without requiring real files.
-
-Expected output pattern:
-```
-1. Health check — GET /health
-  Ollama:         ok
-  Semantic cache: ok
-  FAISS vectors:  0
-
-2. Document ingestion — POST /ingest
-  Uploading 1 file(s): sample.txt
-  Chunks added:   3
-  Total vectors:  3
-
-3. Querying — POST /query
-  Question (cache-enabled): 'What is Retrieval-Augmented Generation?'
-  Cache: MISS (RAG chain executed)
-  Chunks retrieved: 3
-  Latency: 4231 ms
-
-  Question (cache-enabled): 'Can you explain what RAG means in AI?'
-  Cache: HIT  (returned from semantic cache)
-  Chunks retrieved: 0
-  Latency: 48 ms
-
-4. Latency comparison — cache vs RAG
-  RAG (first call, cache miss):  MISS | latency: 4 s
-  Cache hit (same question):     HIT  | latency: 50 ms
-  Speed-up (miss → hit):         80×
-```
-
-### Unit-test cache isolation
-
-Verify that the `cache_client` degrades gracefully when the cache service is unavailable:
-
-```python
-# test_cache_client.py
-import os
-os.environ["SEMCACHE_BASE_URL"] = "http://localhost:9999"  # unreachable
-os.environ["SEMCACHE_TIMEOUT"] = "1.0"
-
-from cache_client import SemanticCacheClient
-
-client = SemanticCacheClient()
-
-# is_available() should return False, not raise
-assert client.is_available() is False
-
-# lookup() should return None (graceful miss), not raise
-assert client.lookup("any question") is None
-
-# store() should be silent, not raise
-client.store("any question", "any answer")
-
-print("Graceful degradation confirmed ✓")
-```
-
-Run it:
-```bash
-python test_cache_client.py
-```
-
-### End-to-end integration test
-
-With both services running:
-
-```bash
-RAG_KEY="your-rag-key"
-
-# 1. Ingest
-curl -s -X POST http://localhost:8001/ingest \
-  -H "X-API-Key: $RAG_KEY" \
-  -F "files=@./sample_docs/sample.txt"
-
-# 2. First query (cache miss)
-RESP=$(curl -s -X POST http://localhost:8001/query \
-  -H "X-API-Key: $RAG_KEY" -H "Content-Type: application/json" \
-  -d '{"question": "What is RAG?"}')
-echo "cache_hit: $(echo $RESP | python -m json.tool | grep cache_hit)"
-
-# 3. Same query again (should be cache hit)
-RESP=$(curl -s -X POST http://localhost:8001/query \
-  -H "X-API-Key: $RAG_KEY" -H "Content-Type: application/json" \
-  -d '{"question": "What is RAG?"}')
-echo "cache_hit: $(echo $RESP | python -m json.tool | grep cache_hit)"
-# Expected: "cache_hit": true
-```
+> `workflow:app` still works as a backward-compatible alias but `app:app` is preferred.
 
 ---
 
 ## Relationship to Semantic Cache service
 
-| Aspect | semcache-api | rag-api |
+| Aspect | `semcache-api` | `rag-api` |
 |---|---|---|
 | Port | 8000 | 8001 |
-| Responsibility | Semantic cache (FAISS + Redis + Ollama embeddings) | RAG pipeline (document ingestion + retrieval + LLM generation) |
-| Knows about RAG? | No | No (delegates via HTTP) |
-| Knows about Redis/FAISS vectors? | Yes | No |
+| Responsibility | Semantic cache (FAISS + Redis + Ollama embeddings) | RAG pipeline (document ingestion + retrieval + generation) |
+| Knows about the other? | No | No (delegates via HTTP) |
 | Can be used standalone? | Yes — any HTTP client | Yes — degrades gracefully if semcache-api is down |
 | Scale independently? | Yes | Yes |
 
 See [SemanticCaching/README.md](../SemanticCaching/README.md) for full cache service documentation.
+
+
